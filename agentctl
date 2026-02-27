@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+agentctl - A lightweight CLI for managing AI agent tasks and state.
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+__version__ = "0.1.0"
+
+DEFAULT_DB_PATH = Path.home() / ".agentctl" / "tasks.db"
+
+
+class TaskStore:
+    """SQLite-backed task storage."""
+    
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize the database schema."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    status TEXT DEFAULT 'pending',
+                    priority TEXT DEFAULT 'medium',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    metadata TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+    
+    def add_task(self, title: str, description: str = "", priority: str = "medium", 
+                 metadata: Optional[dict] = None) -> int:
+        """Add a new task. Returns task ID."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """INSERT INTO tasks (title, description, priority, metadata)
+                   VALUES (?, ?, ?, ?)""",
+                (title, description, priority, json.dumps(metadata) if metadata else None)
+            )
+            conn.commit()
+            return cursor.lastrowid
+    
+    def list_tasks(self, status: Optional[str] = None, limit: int = 50) -> list:
+        """List tasks, optionally filtered by status."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+            return [dict(row) for row in rows]
+    
+    def get_task(self, task_id: int) -> Optional[dict]:
+        """Get a single task by ID."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    
+    def update_task(self, task_id: int, **kwargs) -> bool:
+        """Update task fields."""
+        allowed = {"title", "description", "status", "priority", "metadata"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        
+        if not updates:
+            return False
+        
+        if "status" in updates and updates["status"] == "completed":
+            updates["completed_at"] = datetime.now().isoformat()
+        
+        updates["updated_at"] = datetime.now().isoformat()
+        
+        with sqlite3.connect(self.db_path) as conn:
+            set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+            values = list(updates.values()) + [task_id]
+            cursor = conn.execute(
+                f"UPDATE tasks SET {set_clause} WHERE id = ?",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def delete_task(self, task_id: int) -> bool:
+        """Delete a task."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def set_state(self, key: str, value: str):
+        """Set a state value."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT INTO state (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value,
+                   updated_at = excluded.updated_at""",
+                (key, value, datetime.now().isoformat())
+            )
+            conn.commit()
+    
+    def get_state(self, key: str) -> Optional[str]:
+        """Get a state value."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM state WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+    
+    def get_stats(self) -> dict:
+        """Get task statistics."""
+        with sqlite3.connect(self.db_path) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'pending'"
+            ).fetchone()[0]
+            in_progress = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'"
+            ).fetchone()[0]
+            completed = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'completed'"
+            ).fetchone()[0]
+            return {
+                "total": total,
+                "pending": pending,
+                "in_progress": in_progress,
+                "completed": completed
+            }
+
+
+def cmd_add(store: TaskStore, args):
+    """Add a new task."""
+    task_id = store.add_task(
+        title=args.title,
+        description=args.description or "",
+        priority=args.priority or "medium",
+        metadata=json.loads(args.metadata) if args.metadata else None
+    )
+    print(f"Created task #{task_id}: {args.title}")
+
+
+def cmd_list(store: TaskStore, args):
+    """List tasks."""
+    tasks = store.list_tasks(status=args.status, limit=args.limit)
+    
+    if not tasks:
+        print("No tasks found.")
+        return
+    
+    # Header
+    print(f"{'ID':>4} {'Status':>12} {'Priority':>8} {'Title':<40} {'Created':<19}")
+    print("-" * 95)
+    
+    for task in tasks:
+        status_emoji = {
+            "pending": "⏳",
+            "in_progress": "🔄",
+            "completed": "✅",
+            "blocked": "🚫"
+        }.get(task["status"], "❓")
+        
+        title = task["title"][:38] + ".." if len(task["title"]) > 40 else task["title"]
+        created = task["created_at"][:19] if task["created_at"] else ""
+        
+        print(f"{task['id']:>4} {status_emoji} {task['status']:<10} {task['priority']:<8} {title:<40} {created:<19}")
+
+
+def cmd_show(store: TaskStore, args):
+    """Show task details."""
+    task = store.get_task(args.task_id)
+    if not task:
+        print(f"Task #{args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"Task #{task['id']}: {task['title']}")
+    print(f"Status: {task['status']}")
+    print(f"Priority: {task['priority']}")
+    print(f"Created: {task['created_at']}")
+    print(f"Updated: {task['updated_at']}")
+    if task['completed_at']:
+        print(f"Completed: {task['completed_at']}")
+    if task['description']:
+        print(f"\nDescription:\n{task['description']}")
+    if task['metadata']:
+        print(f"\nMetadata:\n{json.dumps(json.loads(task['metadata']), indent=2)}")
+
+
+def cmd_update(store: TaskStore, args):
+    """Update a task."""
+    updates = {}
+    if args.title:
+        updates["title"] = args.title
+    if args.description:
+        updates["description"] = args.description
+    if args.status:
+        updates["status"] = args.status
+    if args.priority:
+        updates["priority"] = args.priority
+    if args.metadata:
+        updates["metadata"] = json.loads(args.metadata)
+    
+    if store.update_task(args.task_id, **updates):
+        print(f"Updated task #{args.task_id}")
+    else:
+        print(f"Task #{args.task_id} not found or no changes.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_delete(store: TaskStore, args):
+    """Delete a task."""
+    if store.delete_task(args.task_id):
+        print(f"Deleted task #{args.task_id}")
+    else:
+        print(f"Task #{args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_status(store: TaskStore, args):
+    """Show overall status."""
+    stats = store.get_stats()
+    print("Task Statistics:")
+    print(f"  Total: {stats['total']}")
+    print(f"  ⏳ Pending: {stats['pending']}")
+    print(f"  🔄 In Progress: {stats['in_progress']}")
+    print(f"  ✅ Completed: {stats['completed']}")
+
+
+def cmd_state_set(store: TaskStore, args):
+    """Set a state value."""
+    store.set_state(args.key, args.value)
+    print(f"Set {args.key} = {args.value}")
+
+
+def cmd_state_get(store: TaskStore, args):
+    """Get a state value."""
+    value = store.get_state(args.key)
+    if value is not None:
+        print(value)
+    else:
+        print(f"Key '{args.key}' not set.", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="agentctl",
+        description="Lightweight CLI for managing AI agent tasks and state"
+    )
+    parser.add_argument("--db", type=Path, help="Database path (default: ~/.agentctl/tasks.db)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    
+    # Add command
+    add_parser = subparsers.add_parser("add", help="Add a new task")
+    add_parser.add_argument("title", help="Task title")
+    add_parser.add_argument("-d", "--description", help="Task description")
+    add_parser.add_argument("-p", "--priority", choices=["low", "medium", "high"], 
+                           default="medium", help="Task priority")
+    add_parser.add_argument("-m", "--metadata", help="JSON metadata string")
+    add_parser.set_defaults(func=cmd_add)
+    
+    # List command
+    list_parser = subparsers.add_parser("list", help="List tasks")
+    list_parser.add_argument("-s", "--status", choices=["pending", "in_progress", "completed", "blocked"],
+                            help="Filter by status")
+    list_parser.add_argument("-n", "--limit", type=int, default=50, help="Limit results")
+    list_parser.set_defaults(func=cmd_list)
+    
+    # Show command
+    show_parser = subparsers.add_parser("show", help="Show task details")
+    show_parser.add_argument("task_id", type=int, help="Task ID")
+    show_parser.set_defaults(func=cmd_show)
+    
+    # Update command
+    update_parser = subparsers.add_parser("update", help="Update a task")
+    update_parser.add_argument("task_id", type=int, help="Task ID")
+    update_parser.add_argument("-t", "--title", help="New title")
+    update_parser.add_argument("-d", "--description", help="New description")
+    update_parser.add_argument("-s", "--status", choices=["pending", "in_progress", "completed", "blocked"],
+                              help="New status")
+    update_parser.add_argument("-p", "--priority", choices=["low", "medium", "high"],
+                              help="New priority")
+    update_parser.add_argument("-m", "--metadata", help="JSON metadata string")
+    update_parser.set_defaults(func=cmd_update)
+    
+    # Delete command
+    delete_parser = subparsers.add_parser("delete", help="Delete a task")
+    delete_parser.add_argument("task_id", type=int, help="Task ID")
+    delete_parser.set_defaults(func=cmd_delete)
+    
+    # Status command
+    status_parser = subparsers.add_parser("status", help="Show overall status")
+    status_parser.set_defaults(func=cmd_status)
+    
+    # State subcommand
+    state_parser = subparsers.add_parser("state", help="Manage state values")
+    state_subparsers = state_parser.add_subparsers(dest="state_command", help="State commands")
+    
+    state_set_parser = state_subparsers.add_parser("set", help="Set a state value")
+    state_set_parser.add_argument("key", help="State key")
+    state_set_parser.add_argument("value", help="State value")
+    state_set_parser.set_defaults(func=cmd_state_set)
+    
+    state_get_parser = state_subparsers.add_parser("get", help="Get a state value")
+    state_get_parser.add_argument("key", help="State key")
+    state_get_parser.set_defaults(func=cmd_state_get)
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    
+    store = TaskStore(args.db)
+    args.func(store, args)
+
+
+if __name__ == "__main__":
+    main()
