@@ -2,7 +2,7 @@
 
 A lightweight CLI for managing AI agent tasks and state.
 
-`agentctl` provides a simple task queue and state management system for autonomous agents. It uses SQLite for storage, requires no external dependencies beyond Python 3.8+, and is designed to be embedded in agent workflows.
+`agentctl` provides a simple task queue, state management system, and event logging for autonomous agents. It uses SQLite for storage, requires no external dependencies beyond Python 3.8+, and is designed to be embedded in agent workflows.
 
 ## Features
 
@@ -10,6 +10,8 @@ A lightweight CLI for managing AI agent tasks and state.
 - **Status Tracking**: Track task states (pending, in_progress, completed, blocked)
 - **Priority Levels**: Assign low/medium/high priority to tasks
 - **State Storage**: Key-value state storage for agent persistence
+- **Event Logging**: Log structured events with tags and JSON data payloads
+- **Reports**: Generate time-window summaries of tasks and events
 - **Zero Dependencies**: Uses only Python standard library + SQLite
 - **Simple CLI**: Intuitive commands with emoji-enhanced output
 
@@ -48,8 +50,14 @@ agentctl update 1 -s in_progress
 # Mark as completed
 agentctl update 1 -s completed
 
-# Check overall status
-agentctl status
+# Log an event
+agentctl log "Processed 42 records" --tag sync --data '{"count":42}'
+
+# Show recent events
+agentctl logs --since 1h
+
+# Generate a report for the last 24 hours
+agentctl report
 ```
 
 ## Usage Examples
@@ -90,34 +98,83 @@ LAST_RUN=$(agentctl state get last_run)
 echo "Last run: $LAST_RUN"
 ```
 
+### Event Logging
+
+```bash
+# Log a plain event
+agentctl log "Agent started"
+
+# Log with a tag (useful for filtering later)
+agentctl log "Fetched 100 records" --tag sync
+
+# Log with structured JSON data
+agentctl log "Rate limit hit" --tag error --data '{"code":429,"retry_after":60}'
+
+# List all events
+agentctl logs
+
+# Filter by tag
+agentctl logs --tag error
+
+# Show events from the last hour
+agentctl logs --since 1h
+
+# Show events from the last 7 days, including data payloads
+agentctl logs --since 7d --data
+```
+
+Duration formats for `--since`: `30m` (minutes), `1h` (hours), `7d` (days).
+
+### Reports
+
+```bash
+# Default: last 24 hours
+agentctl report
+
+# Custom window
+agentctl report --since 7d
+agentctl report --since 1h
+```
+
+A report shows:
+- Task totals (all time) and tasks completed within the window
+- Event counts by tag within the window
+- The 10 most recent events
+
 ### Integration in Agent Workflows
 
 ```bash
 #!/bin/bash
-# Example: Daily agent workflow
+# Example: Daily agent workflow with event logging
 
 # Check if already running
 if [ "$(agentctl state get daily_run_status)" = "running" ]; then
-    echo "Daily run already in progress"
+    agentctl log "Skipped: daily run already in progress" --tag cron
     exit 0
 fi
 
 agentctl state set daily_run_status "running"
+agentctl log "Daily run started" --tag cron
 
 # Process pending tasks
 for task_id in $(agentctl list -s pending --limit 10 | tail -n +3 | awk '{print $1}'); do
     agentctl update "$task_id" -s in_progress
-    
-    # Do the work...
+
     if process_task "$task_id"; then
         agentctl update "$task_id" -s completed
+        agentctl log "Task $task_id completed" --tag cron
     else
         agentctl update "$task_id" -s blocked
+        agentctl log "Task $task_id blocked" --tag error
     fi
 done
 
 agentctl state set daily_run_status "idle"
 agentctl state set last_run "$(date -Iseconds)"
+agentctl log "Daily run finished" --tag cron
+
+# Print a summary
+agentctl report --since 1h
 ```
 
 ## Commands
@@ -132,6 +189,9 @@ agentctl state set last_run "$(date -Iseconds)"
 | `status` | Show task statistics |
 | `state set` | Store a state value |
 | `state get` | Retrieve a state value |
+| `log` | Log a structured event |
+| `logs` | List recent events with optional filters |
+| `report` | Generate a summary report of tasks and events |
 
 ## Options
 
@@ -143,6 +203,9 @@ agentctl state set last_run "$(date -Iseconds)"
 | `-m, --metadata` | JSON metadata string |
 | `-n, --limit` | Limit number of results |
 | `--db` | Custom database path |
+| `--tag` | Tag for event log/filter |
+| `--data` | JSON data payload (log) or show payloads flag (logs) |
+| `--since` | Duration window: 30m, 1h, 24h, 7d |
 
 ## Database
 
@@ -151,6 +214,8 @@ By default, data is stored in `~/.agentctl/tasks.db`. Override with `--db` flag:
 ```bash
 agentctl --db /path/to/custom.db status
 ```
+
+The database has three tables: `tasks`, `state`, and `events`.
 
 ## Requirements
 

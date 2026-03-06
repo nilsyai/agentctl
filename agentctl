@@ -8,17 +8,33 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_DB_PATH = Path.home() / ".agentctl" / "tasks.db"
 
 
+def parse_duration(duration: str) -> datetime:
+    """Parse a duration string (e.g. 1h, 24h, 7d) into a cutoff datetime."""
+    duration = duration.strip().lower()
+    if duration.endswith("h"):
+        hours = int(duration[:-1])
+        return datetime.now() - timedelta(hours=hours)
+    elif duration.endswith("d"):
+        days = int(duration[:-1])
+        return datetime.now() - timedelta(days=days)
+    elif duration.endswith("m"):
+        minutes = int(duration[:-1])
+        return datetime.now() - timedelta(minutes=minutes)
+    else:
+        raise ValueError(f"Unrecognised duration format: {duration!r}. Use e.g. 30m, 1h, 24h, 7d")
+
+
 class TaskStore:
-    """SQLite-backed task storage."""
+    """SQLite-backed task and event storage."""
     
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -48,8 +64,21 @@ class TaskStore:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    message TEXT NOT NULL,
+                    tag TEXT,
+                    data TEXT
+                )
+            """)
             conn.commit()
     
+    # -------------------------------------------------------------------------
+    # Task methods
+    # -------------------------------------------------------------------------
+
     def add_task(self, title: str, description: str = "", priority: str = "medium", 
                  metadata: Optional[dict] = None) -> int:
         """Add a new task. Returns task ID."""
@@ -158,6 +187,82 @@ class TaskStore:
                 "completed": completed
             }
 
+    # -------------------------------------------------------------------------
+    # Event methods
+    # -------------------------------------------------------------------------
+
+    def add_event(self, message: str, tag: Optional[str] = None,
+                  data: Optional[dict] = None) -> int:
+        """Log a new event. Returns event ID."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """INSERT INTO events (timestamp, message, tag, data)
+                   VALUES (?, ?, ?, ?)""",
+                (datetime.now().isoformat(), message, tag,
+                 json.dumps(data) if data else None)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def list_events(self, tag: Optional[str] = None,
+                    since: Optional[datetime] = None,
+                    limit: int = 50) -> list:
+        """List events, optionally filtered by tag and/or cutoff time."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            clauses = []
+            params: list = []
+            if tag:
+                clauses.append("tag = ?")
+                params.append(tag)
+            if since:
+                clauses.append("timestamp >= ?")
+                params.append(since.isoformat())
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            params.append(limit)
+            rows = conn.execute(
+                f"SELECT * FROM events {where} ORDER BY timestamp DESC LIMIT ?",
+                params
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_event_stats(self, since: Optional[datetime] = None) -> dict:
+        """Get event statistics, optionally scoped to a time window."""
+        with sqlite3.connect(self.db_path) as conn:
+            where = ""
+            params: list = []
+            if since:
+                where = "WHERE timestamp >= ?"
+                params.append(since.isoformat())
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM events {where}", params
+            ).fetchone()[0]
+            tags = conn.execute(
+                f"SELECT tag, COUNT(*) as cnt FROM events {where} "
+                f"GROUP BY tag ORDER BY cnt DESC",
+                params
+            ).fetchall()
+            return {
+                "total": total,
+                "by_tag": [{"tag": t[0] or "(untagged)", "count": t[1]} for t in tags]
+            }
+
+    def get_tasks_completed_since(self, since: datetime) -> list:
+        """Return tasks completed within the given time window."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT * FROM tasks
+                   WHERE status = 'completed' AND completed_at >= ?
+                   ORDER BY completed_at DESC""",
+                (since.isoformat(),)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+
+# =============================================================================
+# Command handlers
+# =============================================================================
 
 def cmd_add(store: TaskStore, args):
     """Add a new task."""
@@ -272,6 +377,110 @@ def cmd_state_get(store: TaskStore, args):
         sys.exit(1)
 
 
+def cmd_log(store: TaskStore, args):
+    """Log a structured event."""
+    data = None
+    if args.data:
+        try:
+            data = json.loads(args.data)
+        except json.JSONDecodeError as exc:
+            print(f"Invalid JSON for --data: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    event_id = store.add_event(message=args.message, tag=args.tag, data=data)
+    tag_str = f" [{args.tag}]" if args.tag else ""
+    print(f"Logged event #{event_id}{tag_str}: {args.message}")
+
+
+def cmd_logs(store: TaskStore, args):
+    """List recent events."""
+    since = None
+    if args.since:
+        try:
+            since = parse_duration(args.since)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+
+    events = store.list_events(tag=args.tag, since=since, limit=args.limit)
+
+    if not events:
+        print("No events found.")
+        return
+
+    print(f"{'ID':>5} {'Timestamp':<19} {'Tag':<15} {'Message'}")
+    print("-" * 80)
+    for ev in events:
+        tag = (ev["tag"] or "")[:13]
+        ts = (ev["timestamp"] or "")[:19]
+        msg = ev["message"]
+        if len(msg) > 50:
+            msg = msg[:48] + ".."
+        print(f"{ev['id']:>5} {ts:<19} {tag:<15} {msg}")
+        if ev["data"] and args.data:
+            print(f"       data: {ev['data']}")
+
+
+def cmd_report(store: TaskStore, args):
+    """Generate a summary report of tasks and events."""
+    since_str = args.since or "24h"
+    try:
+        since = parse_duration(since_str)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+    window_label = since_str
+    now_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    since_label = since.strftime("%Y-%m-%d %H:%M:%S")
+
+    print("=" * 60)
+    print(f"  agentctl Report  |  last {window_label}")
+    print(f"  Generated: {now_label}")
+    print(f"  Window start: {since_label}")
+    print("=" * 60)
+
+    # Task summary
+    stats = store.get_stats()
+    print("\n-- Tasks (all time) --")
+    print(f"  Total:       {stats['total']}")
+    print(f"  ⏳ Pending:   {stats['pending']}")
+    print(f"  🔄 In Progress: {stats['in_progress']}")
+    print(f"  ✅ Completed: {stats['completed']}")
+
+    completed_recent = store.get_tasks_completed_since(since)
+    if completed_recent:
+        print(f"\n-- Tasks completed in last {window_label} --")
+        for task in completed_recent:
+            ts = (task["completed_at"] or "")[:19]
+            print(f"  #{task['id']:>3} [{ts}] {task['title']}")
+    else:
+        print(f"\n  No tasks completed in the last {window_label}.")
+
+    # Event summary
+    ev_stats = store.get_event_stats(since=since)
+    print(f"\n-- Events in last {window_label} --")
+    print(f"  Total events: {ev_stats['total']}")
+    if ev_stats["by_tag"]:
+        print("  By tag:")
+        for entry in ev_stats["by_tag"]:
+            print(f"    {entry['tag']:<20} {entry['count']}")
+
+    recent_events = store.list_events(since=since, limit=10)
+    if recent_events:
+        print(f"\n-- Recent events (up to 10) --")
+        for ev in recent_events:
+            ts = (ev["timestamp"] or "")[:19]
+            tag = f"[{ev['tag']}] " if ev["tag"] else ""
+            print(f"  #{ev['id']:>3} [{ts}] {tag}{ev['message']}")
+
+    print("\n" + "=" * 60)
+
+
+# =============================================================================
+# CLI wiring
+# =============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
         prog="agentctl",
@@ -336,7 +545,30 @@ def main():
     state_get_parser = state_subparsers.add_parser("get", help="Get a state value")
     state_get_parser.add_argument("key", help="State key")
     state_get_parser.set_defaults(func=cmd_state_get)
-    
+
+    # Log command
+    log_parser = subparsers.add_parser("log", help="Log a structured event")
+    log_parser.add_argument("message", help="Event message")
+    log_parser.add_argument("--tag", help="Optional tag to categorise the event")
+    log_parser.add_argument("--data", help="Optional JSON data payload")
+    log_parser.set_defaults(func=cmd_log)
+
+    # Logs command
+    logs_parser = subparsers.add_parser("logs", help="List recent events")
+    logs_parser.add_argument("--tag", help="Filter by tag")
+    logs_parser.add_argument("--since", metavar="DURATION",
+                             help="Only show events from the last DURATION (e.g. 1h, 24h, 7d)")
+    logs_parser.add_argument("-n", "--limit", type=int, default=50, help="Limit results")
+    logs_parser.add_argument("--data", action="store_true",
+                             help="Also print the data payload for each event")
+    logs_parser.set_defaults(func=cmd_logs)
+
+    # Report command
+    report_parser = subparsers.add_parser("report", help="Generate a summary report")
+    report_parser.add_argument("--since", metavar="DURATION", default="24h",
+                               help="Report window (default: 24h). E.g. 1h, 7d")
+    report_parser.set_defaults(func=cmd_report)
+
     args = parser.parse_args()
     
     if not args.command:
