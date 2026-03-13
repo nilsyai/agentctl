@@ -10,6 +10,8 @@ A lightweight CLI for managing AI agent tasks and state.
 - **Status Tracking**: Track task states (pending, in_progress, completed, blocked)
 - **Priority Levels**: Assign low/medium/high priority to tasks
 - **State Storage**: Key-value state storage for agent persistence
+- **Checkpoints**: Export/restore full state to portable JSON - survive context resets, migrate between machines
+- **Purge**: Clean wipe of tasks, events, state, or everything
 - **Event Logging**: Log structured events with tags and JSON data payloads
 - **Reports**: Generate time-window summaries of tasks and events
 - **Zero Dependencies**: Uses only Python standard library + SQLite
@@ -192,6 +194,9 @@ agentctl report --since 1h
 | `log` | Log a structured event |
 | `logs` | List recent events with optional filters |
 | `report` | Generate a summary report of tasks and events |
+| `checkpoint` | Export full state to a portable JSON file |
+| `restore` | Restore state from a checkpoint file |
+| `purge` | Delete all data (or specific tables) |
 
 ## Options
 
@@ -206,6 +211,31 @@ agentctl report --since 1h
 | `--tag` | Tag for event log/filter |
 | `--data` | JSON data payload (log) or show payloads flag (logs) |
 | `--since` | Duration window: 30m, 1h, 24h, 7d |
+| `-o, --output` | Checkpoint output file path |
+| `--merge` | Merge restored data instead of replacing |
+| `-y, --yes` | Skip purge confirmation |
+
+### Checkpoints & Recovery
+
+```bash
+# Save a checkpoint before risky operations
+agentctl checkpoint -o backup.json
+
+# Restore from checkpoint (replaces current data)
+agentctl restore backup.json
+
+# Merge checkpoint into existing data
+agentctl restore backup.json --merge
+
+# Wipe everything
+agentctl purge -y
+
+# Wipe only events
+agentctl purge events -y
+```
+
+Checkpoints are portable JSON - move them between machines, back them up, diff them in git.
+Useful for agent continuity across context resets or when migrating between environments.
 
 ## Database
 

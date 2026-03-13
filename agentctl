@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_DB_PATH = Path.home() / ".agentctl" / "tasks.db"
 
@@ -167,6 +167,67 @@ class TaskStore:
             ).fetchone()
             return row[0] if row else None
     
+    def export_all(self) -> dict:
+        """Export all tasks, state, and events as a portable dict."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()]
+            state = [dict(r) for r in conn.execute("SELECT * FROM state ORDER BY key").fetchall()]
+            events = [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY id").fetchall()]
+        return {
+            "version": __version__,
+            "exported_at": datetime.now().isoformat(),
+            "db_path": str(self.db_path),
+            "tasks": tasks,
+            "state": state,
+            "events": events,
+        }
+
+    def import_all(self, data: dict, merge: bool = False):
+        """Import tasks, state, and events from a checkpoint dict."""
+        with sqlite3.connect(self.db_path) as conn:
+            if not merge:
+                conn.execute("DELETE FROM tasks")
+                conn.execute("DELETE FROM state")
+                conn.execute("DELETE FROM events")
+
+            for t in data.get("tasks", []):
+                cols = ["title", "description", "status", "priority",
+                        "created_at", "updated_at", "completed_at", "metadata"]
+                vals = [t.get(c) for c in cols]
+                conn.execute(
+                    f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                    vals,
+                )
+
+            for s in data.get("state", []):
+                conn.execute(
+                    "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES (?, ?, ?)",
+                    (s["key"], s["value"], s.get("updated_at", datetime.now().isoformat())),
+                )
+
+            for e in data.get("events", []):
+                conn.execute(
+                    "INSERT INTO events (timestamp, message, tag, data) VALUES (?, ?, ?, ?)",
+                    (e.get("timestamp"), e["message"], e.get("tag"), e.get("data")),
+                )
+            conn.commit()
+
+    def purge(self, target: str = "all"):
+        """Delete data. target: 'tasks', 'events', 'state', or 'all'."""
+        tables = {
+            "tasks": ["tasks"],
+            "events": ["events"],
+            "state": ["state"],
+            "all": ["tasks", "state", "events"],
+        }
+        if target not in tables:
+            raise ValueError(f"Unknown purge target: {target!r}. Use tasks/events/state/all")
+        with sqlite3.connect(self.db_path) as conn:
+            for tbl in tables[target]:
+                conn.execute(f"DELETE FROM {tbl}")
+            conn.commit()
+
     def get_stats(self) -> dict:
         """Get task statistics."""
         with sqlite3.connect(self.db_path) as conn:
@@ -481,6 +542,40 @@ def cmd_report(store: TaskStore, args):
 # CLI wiring
 # =============================================================================
 
+def cmd_checkpoint(store: TaskStore, args):
+    """Export full state to a JSON checkpoint file."""
+    data = store.export_all()
+    out_path = Path(args.output) if args.output else Path(f"agentctl-checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
+    out_path.write_text(json.dumps(data, indent=2))
+    counts = f"{len(data['tasks'])} tasks, {len(data['state'])} state keys, {len(data['events'])} events"
+    print(f"Checkpoint saved: {out_path} ({counts})")
+
+
+def cmd_restore(store: TaskStore, args):
+    """Restore state from a checkpoint file."""
+    in_path = Path(args.file)
+    if not in_path.exists():
+        print(f"File not found: {in_path}", file=sys.stderr)
+        sys.exit(1)
+    data = json.loads(in_path.read_text())
+    store.import_all(data, merge=args.merge)
+    mode = "merged into" if args.merge else "restored to"
+    counts = f"{len(data.get('tasks', []))} tasks, {len(data.get('state', []))} state keys, {len(data.get('events', []))} events"
+    print(f"Data {mode} database ({counts})")
+
+
+def cmd_purge(store: TaskStore, args):
+    """Purge data from the database."""
+    target = args.target or "all"
+    if not args.yes:
+        answer = input(f"Purge {target}? This cannot be undone. [y/N] ")
+        if answer.lower() != "y":
+            print("Aborted.")
+            return
+    store.purge(target)
+    print(f"Purged: {target}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="agentctl",
@@ -568,6 +663,27 @@ def main():
     report_parser.add_argument("--since", metavar="DURATION", default="24h",
                                help="Report window (default: 24h). E.g. 1h, 7d")
     report_parser.set_defaults(func=cmd_report)
+
+    # Checkpoint command
+    cp_parser = subparsers.add_parser("checkpoint", help="Export full state to a JSON file")
+    cp_parser.add_argument("-o", "--output", help="Output file path (default: auto-named)")
+    cp_parser.set_defaults(func=cmd_checkpoint)
+
+    # Restore command
+    restore_parser = subparsers.add_parser("restore", help="Restore state from a checkpoint file")
+    restore_parser.add_argument("file", help="Checkpoint JSON file to restore from")
+    restore_parser.add_argument("--merge", action="store_true",
+                                help="Merge into existing data instead of replacing")
+    restore_parser.set_defaults(func=cmd_restore)
+
+    # Purge command
+    purge_parser = subparsers.add_parser("purge", help="Delete all data (or specific tables)")
+    purge_parser.add_argument("target", nargs="?", default="all",
+                              choices=["tasks", "events", "state", "all"],
+                              help="What to purge (default: all)")
+    purge_parser.add_argument("-y", "--yes", action="store_true",
+                              help="Skip confirmation prompt")
+    purge_parser.set_defaults(func=cmd_purge)
 
     args = parser.parse_args()
     
