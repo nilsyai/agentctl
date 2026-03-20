@@ -9,6 +9,7 @@ A lightweight CLI for managing AI agent tasks and state.
 - **Task Management**: Create, list, update, and delete tasks
 - **Status Tracking**: Track task states (pending, in_progress, completed, blocked)
 - **Priority Levels**: Assign low/medium/high priority to tasks
+- **Task Tagging**: Tag tasks with comma-separated labels and filter or summarise by tag
 - **State Storage**: Key-value state storage for agent persistence
 - **Checkpoints**: Export/restore full state to portable JSON - survive context resets, migrate between machines
 - **Purge**: Clean wipe of tasks, events, state, or everything
@@ -43,11 +44,23 @@ Or use directly without installing:
 # Add a task
 agentctl add "Review pull requests" -d "Check and review pending PRs" -p high
 
+# Add a task with tags
+agentctl add "Deploy v2.0" -p high --tags "deploy,urgent"
+
 # List all tasks
 agentctl list
 
+# Filter tasks by tag
+agentctl list --tag deploy
+
+# Show all tags with counts
+agentctl tags
+
 # Update task status
 agentctl update 1 -s in_progress
+
+# Update task tags
+agentctl update 1 --tags "deploy,done"
 
 # Mark as completed
 agentctl update 1 -s completed
@@ -71,17 +84,49 @@ agentctl report
 agentctl add "Deploy to production" -p high
 agentctl add "Update documentation" -p low -d "Add examples to README"
 
+# Add a task with tags
+agentctl add "Deploy to production" -p high --tags "deploy,urgent"
+
 # List pending tasks only
 agentctl list -s pending
 
-# Show task details
+# Filter by tag
+agentctl list --tag deploy
+
+# Show task details (includes tags)
 agentctl show 1
 
 # Update task title and priority
 agentctl update 1 -t "Deploy v2.0 to production" -p high
 
+# Add/replace tags on a task
+agentctl update 1 --tags "deploy,release"
+
+# Clear all tags from a task
+agentctl update 1 --tags ""
+
 # Delete a task
 agentctl delete 1
+```
+
+### Task Tagging
+
+```bash
+# Tag a task at creation time
+agentctl add "Fix auth bug" -p high --tags "bug,auth,urgent"
+
+# Add tags when updating
+agentctl update 3 --tags "bug,auth,reviewed"
+
+# List all tasks with a specific tag
+agentctl list --tag bug
+
+# Combine tag filter with status filter
+agentctl list --tag urgent -s pending
+
+# Show all tags across all tasks with counts
+agentctl tags
+# Output: bug (3) | auth (2) | urgent (1) | reviewed (1)
 ```
 
 ### State Management
@@ -189,6 +234,7 @@ agentctl report --since 1h
 | `update` | Modify task properties |
 | `delete` | Remove a task |
 | `status` | Show task statistics |
+| `tags` | List all tags with task counts |
 | `state set` | Store a state value |
 | `state get` | Retrieve a state value |
 | `log` | Log a structured event |
@@ -205,10 +251,11 @@ agentctl report --since 1h
 | `-d, --description` | Task description |
 | `-p, --priority` | Priority: low, medium, high |
 | `-s, --status` | Status: pending, in_progress, completed, blocked |
+| `--tags` | Comma-separated task tags (e.g. `deploy,urgent`) |
+| `--tag` | Filter list by tag / tag for event log |
 | `-m, --metadata` | JSON metadata string |
 | `-n, --limit` | Limit number of results |
 | `--db` | Custom database path |
-| `--tag` | Tag for event log/filter |
 | `--data` | JSON data payload (log) or show payloads flag (logs) |
 | `--since` | Duration window: 30m, 1h, 24h, 7d |
 | `-o, --output` | Checkpoint output file path |

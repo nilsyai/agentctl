@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 DEFAULT_DB_PATH = Path.home() / ".agentctl" / "tasks.db"
 
@@ -73,6 +73,11 @@ class TaskStore:
                     data TEXT
                 )
             """)
+            # Migration: add tags column if missing (v0.4.0+)
+            cursor = conn.execute("PRAGMA table_info(tasks)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "tags" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN tags TEXT")
             conn.commit()
     
     # -------------------------------------------------------------------------
@@ -80,31 +85,40 @@ class TaskStore:
     # -------------------------------------------------------------------------
 
     def add_task(self, title: str, description: str = "", priority: str = "medium", 
-                 metadata: Optional[dict] = None) -> int:
+                 metadata: Optional[dict] = None, tags: Optional[str] = None) -> int:
         """Add a new task. Returns task ID."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                """INSERT INTO tasks (title, description, priority, metadata)
-                   VALUES (?, ?, ?, ?)""",
-                (title, description, priority, json.dumps(metadata) if metadata else None)
+                """INSERT INTO tasks (title, description, priority, metadata, tags)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (title, description, priority,
+                 json.dumps(metadata) if metadata else None, tags)
             )
             conn.commit()
             return cursor.lastrowid
     
-    def list_tasks(self, status: Optional[str] = None, limit: int = 50) -> list:
-        """List tasks, optionally filtered by status."""
+    def list_tasks(self, status: Optional[str] = None, tag: Optional[str] = None,
+                   limit: int = 50) -> list:
+        """List tasks, optionally filtered by status and/or tag."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
+            clauses = []
+            params: list = []
             if status:
-                rows = conn.execute(
-                    "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-                    (status, limit)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
+                clauses.append("status = ?")
+                params.append(status)
+            if tag:
+                # Match tag anywhere in comma-separated list
+                clauses.append(
+                    "(tags = ? OR tags LIKE ? OR tags LIKE ? OR tags LIKE ?)"
+                )
+                params.extend([tag, f"{tag},%", f"%,{tag},%", f"%,{tag}"])
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            params.append(limit)
+            rows = conn.execute(
+                f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ?",
+                params
+            ).fetchall()
             return [dict(row) for row in rows]
     
     def get_task(self, task_id: int) -> Optional[dict]:
@@ -118,7 +132,7 @@ class TaskStore:
     
     def update_task(self, task_id: int, **kwargs) -> bool:
         """Update task fields."""
-        allowed = {"title", "description", "status", "priority", "metadata"}
+        allowed = {"title", "description", "status", "priority", "metadata", "tags"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         
         if not updates:
@@ -167,6 +181,20 @@ class TaskStore:
             ).fetchone()
             return row[0] if row else None
     
+    def get_all_tags(self) -> list:
+        """Return all tags with counts, sorted by count descending."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT tags FROM tasks WHERE tags IS NOT NULL AND tags != ''"
+            ).fetchall()
+        tag_counts: dict = {}
+        for (raw,) in rows:
+            for t in raw.split(","):
+                t = t.strip()
+                if t:
+                    tag_counts[t] = tag_counts.get(t, 0) + 1
+        return sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))
+
     def export_all(self) -> dict:
         """Export all tasks, state, and events as a portable dict."""
         with sqlite3.connect(self.db_path) as conn:
@@ -193,7 +221,8 @@ class TaskStore:
 
             for t in data.get("tasks", []):
                 cols = ["title", "description", "status", "priority",
-                        "created_at", "updated_at", "completed_at", "metadata"]
+                        "created_at", "updated_at", "completed_at", "metadata",
+                        "tags"]
                 vals = [t.get(c) for c in cols]
                 conn.execute(
                     f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
@@ -247,6 +276,18 @@ class TaskStore:
                 "in_progress": in_progress,
                 "completed": completed
             }
+
+    def get_tags(self) -> list:
+        """Return all task tags with counts, sorted by count descending then name."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT tags FROM tasks WHERE tags IS NOT NULL AND tags != ''"
+            ).fetchall()
+            tag_counts: dict = {}
+            for row in rows:
+                for tag in [t.strip() for t in row[0].split(",") if t.strip()]:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            return sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))
 
     # -------------------------------------------------------------------------
     # Event methods
@@ -327,26 +368,29 @@ class TaskStore:
 
 def cmd_add(store: TaskStore, args):
     """Add a new task."""
+    tags = args.tags.strip() if args.tags else None
     task_id = store.add_task(
         title=args.title,
         description=args.description or "",
         priority=args.priority or "medium",
-        metadata=json.loads(args.metadata) if args.metadata else None
+        metadata=json.loads(args.metadata) if args.metadata else None,
+        tags=tags,
     )
-    print(f"Created task #{task_id}: {args.title}")
+    tag_str = f" [{tags}]" if tags else ""
+    print(f"Created task #{task_id}{tag_str}: {args.title}")
 
 
 def cmd_list(store: TaskStore, args):
     """List tasks."""
-    tasks = store.list_tasks(status=args.status, limit=args.limit)
+    tasks = store.list_tasks(status=args.status, tag=args.tag, limit=args.limit)
     
     if not tasks:
         print("No tasks found.")
         return
     
     # Header
-    print(f"{'ID':>4} {'Status':>12} {'Priority':>8} {'Title':<40} {'Created':<19}")
-    print("-" * 95)
+    print(f"{'ID':>4} {'Status':>12} {'Priority':>8} {'Title':<35} {'Tags':<20} {'Created':<19}")
+    print("-" * 110)
     
     for task in tasks:
         status_emoji = {
@@ -356,10 +400,13 @@ def cmd_list(store: TaskStore, args):
             "blocked": "🚫"
         }.get(task["status"], "❓")
         
-        title = task["title"][:38] + ".." if len(task["title"]) > 40 else task["title"]
+        title = task["title"][:33] + ".." if len(task["title"]) > 35 else task["title"]
+        tags = (task.get("tags") or "")[:18]
+        if task.get("tags") and len(task["tags"]) > 18:
+            tags = tags[:16] + ".."
         created = task["created_at"][:19] if task["created_at"] else ""
         
-        print(f"{task['id']:>4} {status_emoji} {task['status']:<10} {task['priority']:<8} {title:<40} {created:<19}")
+        print(f"{task['id']:>4} {status_emoji} {task['status']:<10} {task['priority']:<8} {title:<35} {tags:<20} {created:<19}")
 
 
 def cmd_show(store: TaskStore, args):
@@ -372,6 +419,8 @@ def cmd_show(store: TaskStore, args):
     print(f"Task #{task['id']}: {task['title']}")
     print(f"Status: {task['status']}")
     print(f"Priority: {task['priority']}")
+    if task.get('tags'):
+        print(f"Tags: {task['tags']}")
     print(f"Created: {task['created_at']}")
     print(f"Updated: {task['updated_at']}")
     if task['completed_at']:
@@ -393,6 +442,8 @@ def cmd_update(store: TaskStore, args):
         updates["status"] = args.status
     if args.priority:
         updates["priority"] = args.priority
+    if args.tags is not None:
+        updates["tags"] = args.tags
     if args.metadata:
         updates["metadata"] = json.loads(args.metadata)
     
@@ -420,6 +471,16 @@ def cmd_status(store: TaskStore, args):
     print(f"  ⏳ Pending: {stats['pending']}")
     print(f"  🔄 In Progress: {stats['in_progress']}")
     print(f"  ✅ Completed: {stats['completed']}")
+
+
+def cmd_tags(store: TaskStore, args):
+    """List all tags with task counts."""
+    tags = store.get_tags()
+    if not tags:
+        print("No tags found.")
+        return
+    tag_strs = [f"{tag} ({count})" for tag, count in tags]
+    print(" | ".join(tag_strs))
 
 
 def cmd_state_set(store: TaskStore, args):
@@ -592,6 +653,7 @@ def main():
     add_parser.add_argument("-d", "--description", help="Task description")
     add_parser.add_argument("-p", "--priority", choices=["low", "medium", "high"], 
                            default="medium", help="Task priority")
+    add_parser.add_argument("--tags", help="Comma-separated tags (e.g. deploy,urgent)")
     add_parser.add_argument("-m", "--metadata", help="JSON metadata string")
     add_parser.set_defaults(func=cmd_add)
     
@@ -599,6 +661,7 @@ def main():
     list_parser = subparsers.add_parser("list", help="List tasks")
     list_parser.add_argument("-s", "--status", choices=["pending", "in_progress", "completed", "blocked"],
                             help="Filter by status")
+    list_parser.add_argument("--tag", help="Filter by tag")
     list_parser.add_argument("-n", "--limit", type=int, default=50, help="Limit results")
     list_parser.set_defaults(func=cmd_list)
     
@@ -616,6 +679,7 @@ def main():
                               help="New status")
     update_parser.add_argument("-p", "--priority", choices=["low", "medium", "high"],
                               help="New priority")
+    update_parser.add_argument("--tags", help="Comma-separated tags (e.g. deploy,urgent). Pass empty string to clear.")
     update_parser.add_argument("-m", "--metadata", help="JSON metadata string")
     update_parser.set_defaults(func=cmd_update)
     
@@ -684,6 +748,10 @@ def main():
     purge_parser.add_argument("-y", "--yes", action="store_true",
                               help="Skip confirmation prompt")
     purge_parser.set_defaults(func=cmd_purge)
+
+    # Tags command
+    tags_parser = subparsers.add_parser("tags", help="List all tags with task counts")
+    tags_parser.set_defaults(func=cmd_tags)
 
     args = parser.parse_args()
     
