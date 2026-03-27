@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 DEFAULT_DB_PATH = Path.home() / ".agentctl" / "tasks.db"
 
@@ -33,14 +33,51 @@ def parse_duration(duration: str) -> datetime:
         raise ValueError(f"Unrecognised duration format: {duration!r}. Use e.g. 30m, 1h, 24h, 7d")
 
 
+def parse_due_date(due_str: str) -> str:
+    """
+    Parse a due date string into an ISO-8601 datetime string.
+
+    Accepted formats:
+      - Relative: +1h, +2d, +30m  (from now)
+      - Date only: 2025-06-01       (treated as end of that day 23:59:59)
+      - Date+time: 2025-06-01T14:00
+    """
+    due_str = due_str.strip()
+    if due_str.startswith("+"):
+        # Relative offset
+        offset = due_str[1:].lower()
+        if offset.endswith("h"):
+            dt = datetime.now() + timedelta(hours=int(offset[:-1]))
+        elif offset.endswith("d"):
+            dt = datetime.now() + timedelta(days=int(offset[:-1]))
+        elif offset.endswith("m"):
+            dt = datetime.now() + timedelta(minutes=int(offset[:-1]))
+        else:
+            raise ValueError(f"Unrecognised relative due format: {due_str!r}. Use e.g. +1h, +2d, +30m")
+        return dt.isoformat(timespec="seconds")
+    # Try explicit date/datetime
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(due_str, fmt)
+            if fmt == "%Y-%m-%d":
+                dt = dt.replace(hour=23, minute=59, second=59)
+            return dt.isoformat(timespec="seconds")
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Unrecognised due date format: {due_str!r}. "
+        "Use +1h / +2d / +30m for relative, or YYYY-MM-DD / YYYY-MM-DDTHH:MM for absolute."
+    )
+
+
 class TaskStore:
     """SQLite-backed task and event storage."""
-    
+
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-    
+
     def _init_db(self):
         """Initialize the database schema."""
         with sqlite3.connect(self.db_path) as conn:
@@ -73,33 +110,44 @@ class TaskStore:
                     data TEXT
                 )
             """)
-            # Migration: add tags column if missing (v0.4.0+)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS task_notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    note TEXT NOT NULL
+                )
+            """)
+            # Migrations: add columns if missing
             cursor = conn.execute("PRAGMA table_info(tasks)")
             columns = {row[1] for row in cursor.fetchall()}
             if "tags" not in columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN tags TEXT")
+            if "due_at" not in columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN due_at TIMESTAMP")
             conn.commit()
-    
+
     # -------------------------------------------------------------------------
     # Task methods
     # -------------------------------------------------------------------------
 
-    def add_task(self, title: str, description: str = "", priority: str = "medium", 
-                 metadata: Optional[dict] = None, tags: Optional[str] = None) -> int:
+    def add_task(self, title: str, description: str = "", priority: str = "medium",
+                 metadata: Optional[dict] = None, tags: Optional[str] = None,
+                 due_at: Optional[str] = None) -> int:
         """Add a new task. Returns task ID."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                """INSERT INTO tasks (title, description, priority, metadata, tags)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO tasks (title, description, priority, metadata, tags, due_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (title, description, priority,
-                 json.dumps(metadata) if metadata else None, tags)
+                 json.dumps(metadata) if metadata else None, tags, due_at)
             )
             conn.commit()
             return cursor.lastrowid
-    
+
     def list_tasks(self, status: Optional[str] = None, tag: Optional[str] = None,
-                   limit: int = 50) -> list:
-        """List tasks, optionally filtered by status and/or tag."""
+                   overdue: bool = False, limit: int = 50) -> list:
+        """List tasks, optionally filtered by status, tag, and/or overdue."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             clauses = []
@@ -108,11 +156,13 @@ class TaskStore:
                 clauses.append("status = ?")
                 params.append(status)
             if tag:
-                # Match tag anywhere in comma-separated list
                 clauses.append(
                     "(tags = ? OR tags LIKE ? OR tags LIKE ? OR tags LIKE ?)"
                 )
                 params.extend([tag, f"{tag},%", f"%,{tag},%", f"%,{tag}"])
+            if overdue:
+                clauses.append("due_at IS NOT NULL AND due_at < ? AND status NOT IN ('completed')")
+                params.append(datetime.now().isoformat())
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             params.append(limit)
             rows = conn.execute(
@@ -120,7 +170,7 @@ class TaskStore:
                 params
             ).fetchall()
             return [dict(row) for row in rows]
-    
+
     def get_task(self, task_id: int) -> Optional[dict]:
         """Get a single task by ID."""
         with sqlite3.connect(self.db_path) as conn:
@@ -129,20 +179,20 @@ class TaskStore:
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             return dict(row) if row else None
-    
+
     def update_task(self, task_id: int, **kwargs) -> bool:
         """Update task fields."""
-        allowed = {"title", "description", "status", "priority", "metadata", "tags"}
+        allowed = {"title", "description", "status", "priority", "metadata", "tags", "due_at"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
-        
+
         if not updates:
             return False
-        
+
         if "status" in updates and updates["status"] == "completed":
             updates["completed_at"] = datetime.now().isoformat()
-        
+
         updates["updated_at"] = datetime.now().isoformat()
-        
+
         with sqlite3.connect(self.db_path) as conn:
             set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
             values = list(updates.values()) + [task_id]
@@ -152,14 +202,43 @@ class TaskStore:
             )
             conn.commit()
             return cursor.rowcount > 0
-    
+
     def delete_task(self, task_id: int) -> bool:
-        """Delete a task."""
+        """Delete a task (and its notes, via CASCADE)."""
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
             cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             conn.commit()
             return cursor.rowcount > 0
-    
+
+    # -------------------------------------------------------------------------
+    # Notes methods
+    # -------------------------------------------------------------------------
+
+    def add_note(self, task_id: int, note: str) -> int:
+        """Append a timestamped note to a task. Returns note ID."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "INSERT INTO task_notes (task_id, timestamp, note) VALUES (?, ?, ?)",
+                (task_id, datetime.now().isoformat(timespec="seconds"), note)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_notes(self, task_id: int) -> list:
+        """Return all notes for a task, oldest first."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM task_notes WHERE task_id = ? ORDER BY timestamp ASC",
+                (task_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    # -------------------------------------------------------------------------
+    # State methods
+    # -------------------------------------------------------------------------
+
     def set_state(self, key: str, value: str):
         """Set a state value."""
         with sqlite3.connect(self.db_path) as conn:
@@ -172,7 +251,7 @@ class TaskStore:
                 (key, value, datetime.now().isoformat())
             )
             conn.commit()
-    
+
     def get_state(self, key: str) -> Optional[str]:
         """Get a state value."""
         with sqlite3.connect(self.db_path) as conn:
@@ -180,28 +259,19 @@ class TaskStore:
                 "SELECT value FROM state WHERE key = ?", (key,)
             ).fetchone()
             return row[0] if row else None
-    
-    def get_all_tags(self) -> list:
-        """Return all tags with counts, sorted by count descending."""
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT tags FROM tasks WHERE tags IS NOT NULL AND tags != ''"
-            ).fetchall()
-        tag_counts: dict = {}
-        for (raw,) in rows:
-            for t in raw.split(","):
-                t = t.strip()
-                if t:
-                    tag_counts[t] = tag_counts.get(t, 0) + 1
-        return sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))
+
+    # -------------------------------------------------------------------------
+    # Export / import / purge
+    # -------------------------------------------------------------------------
 
     def export_all(self) -> dict:
-        """Export all tasks, state, and events as a portable dict."""
+        """Export all tasks, state, events, and notes as a portable dict."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             tasks = [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()]
             state = [dict(r) for r in conn.execute("SELECT * FROM state ORDER BY key").fetchall()]
             events = [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY id").fetchall()]
+            notes = [dict(r) for r in conn.execute("SELECT * FROM task_notes ORDER BY id").fetchall()]
         return {
             "version": __version__,
             "exported_at": datetime.now().isoformat(),
@@ -209,12 +279,14 @@ class TaskStore:
             "tasks": tasks,
             "state": state,
             "events": events,
+            "notes": notes,
         }
 
     def import_all(self, data: dict, merge: bool = False):
-        """Import tasks, state, and events from a checkpoint dict."""
+        """Import tasks, state, events, and notes from a checkpoint dict."""
         with sqlite3.connect(self.db_path) as conn:
             if not merge:
+                conn.execute("DELETE FROM task_notes")
                 conn.execute("DELETE FROM tasks")
                 conn.execute("DELETE FROM state")
                 conn.execute("DELETE FROM events")
@@ -222,7 +294,7 @@ class TaskStore:
             for t in data.get("tasks", []):
                 cols = ["title", "description", "status", "priority",
                         "created_at", "updated_at", "completed_at", "metadata",
-                        "tags"]
+                        "tags", "due_at"]
                 vals = [t.get(c) for c in cols]
                 conn.execute(
                     f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
@@ -240,22 +312,34 @@ class TaskStore:
                     "INSERT INTO events (timestamp, message, tag, data) VALUES (?, ?, ?, ?)",
                     (e.get("timestamp"), e["message"], e.get("tag"), e.get("data")),
                 )
+
+            for n in data.get("notes", []):
+                conn.execute(
+                    "INSERT INTO task_notes (task_id, timestamp, note) VALUES (?, ?, ?)",
+                    (n["task_id"], n.get("timestamp"), n["note"]),
+                )
+
             conn.commit()
 
     def purge(self, target: str = "all"):
-        """Delete data. target: 'tasks', 'events', 'state', or 'all'."""
+        """Delete data. target: 'tasks', 'events', 'state', 'notes', or 'all'."""
         tables = {
-            "tasks": ["tasks"],
+            "tasks": ["task_notes", "tasks"],
             "events": ["events"],
             "state": ["state"],
-            "all": ["tasks", "state", "events"],
+            "notes": ["task_notes"],
+            "all": ["task_notes", "tasks", "state", "events"],
         }
         if target not in tables:
-            raise ValueError(f"Unknown purge target: {target!r}. Use tasks/events/state/all")
+            raise ValueError(f"Unknown purge target: {target!r}. Use tasks/events/state/notes/all")
         with sqlite3.connect(self.db_path) as conn:
             for tbl in tables[target]:
                 conn.execute(f"DELETE FROM {tbl}")
             conn.commit()
+
+    # -------------------------------------------------------------------------
+    # Stats / reporting helpers
+    # -------------------------------------------------------------------------
 
     def get_stats(self) -> dict:
         """Get task statistics."""
@@ -270,11 +354,16 @@ class TaskStore:
             completed = conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'completed'"
             ).fetchone()[0]
+            overdue = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE due_at IS NOT NULL AND due_at < ? AND status NOT IN ('completed')",
+                (datetime.now().isoformat(),)
+            ).fetchone()[0]
             return {
                 "total": total,
                 "pending": pending,
                 "in_progress": in_progress,
-                "completed": completed
+                "completed": completed,
+                "overdue": overdue,
             }
 
     def get_tags(self) -> list:
@@ -288,10 +377,6 @@ class TaskStore:
                 for tag in [t.strip() for t in row[0].split(",") if t.strip()]:
                     tag_counts[tag] = tag_counts.get(tag, 0) + 1
             return sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))
-
-    # -------------------------------------------------------------------------
-    # Event methods
-    # -------------------------------------------------------------------------
 
     def add_event(self, message: str, tag: Optional[str] = None,
                   data: Optional[dict] = None) -> int:
@@ -363,35 +448,66 @@ class TaskStore:
 
 
 # =============================================================================
+# Helper
+# =============================================================================
+
+def _due_indicator(due_at: Optional[str]) -> str:
+    """Return a short due-date display string with overdue marker."""
+    if not due_at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(due_at)
+    except ValueError:
+        return due_at[:10]
+    now = datetime.now()
+    if dt < now:
+        return f"🔴{dt.strftime('%m-%d %H:%M')}"
+    # Within 24h
+    if dt - now < timedelta(hours=24):
+        return f"🟡{dt.strftime('%m-%d %H:%M')}"
+    return dt.strftime("%Y-%m-%d")
+
+
+# =============================================================================
 # Command handlers
 # =============================================================================
 
 def cmd_add(store: TaskStore, args):
     """Add a new task."""
     tags = args.tags.strip() if args.tags else None
+    due_at = None
+    if args.due:
+        try:
+            due_at = parse_due_date(args.due)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
     task_id = store.add_task(
         title=args.title,
         description=args.description or "",
         priority=args.priority or "medium",
         metadata=json.loads(args.metadata) if args.metadata else None,
         tags=tags,
+        due_at=due_at,
     )
     tag_str = f" [{tags}]" if tags else ""
-    print(f"Created task #{task_id}{tag_str}: {args.title}")
+    due_str = f" due:{due_at[:10]}" if due_at else ""
+    print(f"Created task #{task_id}{tag_str}{due_str}: {args.title}")
 
 
 def cmd_list(store: TaskStore, args):
     """List tasks."""
-    tasks = store.list_tasks(status=args.status, tag=args.tag, limit=args.limit)
-    
+    tasks = store.list_tasks(
+        status=args.status, tag=args.tag, overdue=args.overdue, limit=args.limit
+    )
+
     if not tasks:
         print("No tasks found.")
         return
-    
-    # Header
-    print(f"{'ID':>4} {'Status':>12} {'Priority':>8} {'Title':<35} {'Tags':<20} {'Created':<19}")
-    print("-" * 110)
-    
+
+    print(f"{'ID':>4} {'Status':>12} {'Pri':>5} {'Title':<32} {'Tags':<16} {'Due':<17} {'Created':<10}")
+    print("-" * 105)
+
     for task in tasks:
         status_emoji = {
             "pending": "⏳",
@@ -399,14 +515,15 @@ def cmd_list(store: TaskStore, args):
             "completed": "✅",
             "blocked": "🚫"
         }.get(task["status"], "❓")
-        
-        title = task["title"][:33] + ".." if len(task["title"]) > 35 else task["title"]
-        tags = (task.get("tags") or "")[:18]
-        if task.get("tags") and len(task["tags"]) > 18:
-            tags = tags[:16] + ".."
-        created = task["created_at"][:19] if task["created_at"] else ""
-        
-        print(f"{task['id']:>4} {status_emoji} {task['status']:<10} {task['priority']:<8} {title:<35} {tags:<20} {created:<19}")
+
+        title = task["title"][:30] + ".." if len(task["title"]) > 32 else task["title"]
+        tags = (task.get("tags") or "")[:14]
+        if task.get("tags") and len(task["tags"]) > 14:
+            tags = tags[:12] + ".."
+        created = task["created_at"][:10] if task["created_at"] else ""
+        due = _due_indicator(task.get("due_at"))[:15]
+
+        print(f"{task['id']:>4} {status_emoji} {task['status']:<10} {task['priority']:<5} {title:<32} {tags:<16} {due:<17} {created:<10}")
 
 
 def cmd_show(store: TaskStore, args):
@@ -415,20 +532,30 @@ def cmd_show(store: TaskStore, args):
     if not task:
         print(f"Task #{args.task_id} not found.", file=sys.stderr)
         sys.exit(1)
-    
+
     print(f"Task #{task['id']}: {task['title']}")
-    print(f"Status: {task['status']}")
+    print(f"Status:   {task['status']}")
     print(f"Priority: {task['priority']}")
-    if task.get('tags'):
-        print(f"Tags: {task['tags']}")
-    print(f"Created: {task['created_at']}")
-    print(f"Updated: {task['updated_at']}")
-    if task['completed_at']:
-        print(f"Completed: {task['completed_at']}")
-    if task['description']:
+    if task.get("tags"):
+        print(f"Tags:     {task['tags']}")
+    if task.get("due_at"):
+        indicator = _due_indicator(task["due_at"])
+        print(f"Due:      {task['due_at'][:19]}  {indicator}")
+    print(f"Created:  {task['created_at']}")
+    print(f"Updated:  {task['updated_at']}")
+    if task["completed_at"]:
+        print(f"Completed:{task['completed_at']}")
+    if task["description"]:
         print(f"\nDescription:\n{task['description']}")
-    if task['metadata']:
+    if task["metadata"]:
         print(f"\nMetadata:\n{json.dumps(json.loads(task['metadata']), indent=2)}")
+
+    notes = store.get_notes(args.task_id)
+    if notes:
+        print(f"\nNotes ({len(notes)}):")
+        for n in notes:
+            ts = n["timestamp"][:19] if n["timestamp"] else "?"
+            print(f"  [{ts}] {n['note']}")
 
 
 def cmd_update(store: TaskStore, args):
@@ -446,12 +573,30 @@ def cmd_update(store: TaskStore, args):
         updates["tags"] = args.tags
     if args.metadata:
         updates["metadata"] = json.loads(args.metadata)
-    
+    if args.due:
+        try:
+            updates["due_at"] = parse_due_date(args.due)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+    if args.clear_due:
+        updates["due_at"] = None
+
     if store.update_task(args.task_id, **updates):
         print(f"Updated task #{args.task_id}")
     else:
         print(f"Task #{args.task_id} not found or no changes.", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_note(store: TaskStore, args):
+    """Append a timestamped note to a task."""
+    task = store.get_task(args.task_id)
+    if not task:
+        print(f"Task #{args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    note_id = store.add_note(args.task_id, args.text)
+    print(f"Added note #{note_id} to task #{args.task_id}: {args.text[:60]}")
 
 
 def cmd_delete(store: TaskStore, args):
@@ -467,10 +612,12 @@ def cmd_status(store: TaskStore, args):
     """Show overall status."""
     stats = store.get_stats()
     print("Task Statistics:")
-    print(f"  Total: {stats['total']}")
-    print(f"  ⏳ Pending: {stats['pending']}")
+    print(f"  Total:         {stats['total']}")
+    print(f"  ⏳ Pending:     {stats['pending']}")
     print(f"  🔄 In Progress: {stats['in_progress']}")
-    print(f"  ✅ Completed: {stats['completed']}")
+    print(f"  ✅ Completed:   {stats['completed']}")
+    if stats["overdue"]:
+        print(f"  🔴 Overdue:     {stats['overdue']}")
 
 
 def cmd_tags(store: TaskStore, args):
@@ -562,13 +709,14 @@ def cmd_report(store: TaskStore, args):
     print(f"  Window start: {since_label}")
     print("=" * 60)
 
-    # Task summary
     stats = store.get_stats()
     print("\n-- Tasks (all time) --")
-    print(f"  Total:       {stats['total']}")
-    print(f"  ⏳ Pending:   {stats['pending']}")
+    print(f"  Total:         {stats['total']}")
+    print(f"  ⏳ Pending:     {stats['pending']}")
     print(f"  🔄 In Progress: {stats['in_progress']}")
-    print(f"  ✅ Completed: {stats['completed']}")
+    print(f"  ✅ Completed:   {stats['completed']}")
+    if stats["overdue"]:
+        print(f"  🔴 Overdue:     {stats['overdue']}")
 
     completed_recent = store.get_tasks_completed_since(since)
     if completed_recent:
@@ -579,7 +727,13 @@ def cmd_report(store: TaskStore, args):
     else:
         print(f"\n  No tasks completed in the last {window_label}.")
 
-    # Event summary
+    overdue_tasks = store.list_tasks(overdue=True, limit=10)
+    if overdue_tasks:
+        print("\n-- Overdue tasks --")
+        for task in overdue_tasks:
+            due = (task.get("due_at") or "")[:19]
+            print(f"  #{task['id']:>3} [{due}] {task['title']} ({task['status']})")
+
     ev_stats = store.get_event_stats(since=since)
     print(f"\n-- Events in last {window_label} --")
     print(f"  Total events: {ev_stats['total']}")
@@ -599,16 +753,17 @@ def cmd_report(store: TaskStore, args):
     print("\n" + "=" * 60)
 
 
-# =============================================================================
-# CLI wiring
-# =============================================================================
-
 def cmd_checkpoint(store: TaskStore, args):
     """Export full state to a JSON checkpoint file."""
     data = store.export_all()
-    out_path = Path(args.output) if args.output else Path(f"agentctl-checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
+    out_path = Path(args.output) if args.output else Path(
+        f"agentctl-checkpoint-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    )
     out_path.write_text(json.dumps(data, indent=2))
-    counts = f"{len(data['tasks'])} tasks, {len(data['state'])} state keys, {len(data['events'])} events"
+    counts = (
+        f"{len(data['tasks'])} tasks, {len(data['state'])} state keys, "
+        f"{len(data['events'])} events, {len(data['notes'])} notes"
+    )
     print(f"Checkpoint saved: {out_path} ({counts})")
 
 
@@ -621,7 +776,10 @@ def cmd_restore(store: TaskStore, args):
     data = json.loads(in_path.read_text())
     store.import_all(data, merge=args.merge)
     mode = "merged into" if args.merge else "restored to"
-    counts = f"{len(data.get('tasks', []))} tasks, {len(data.get('state', []))} state keys, {len(data.get('events', []))} events"
+    counts = (
+        f"{len(data.get('tasks', []))} tasks, {len(data.get('state', []))} state keys, "
+        f"{len(data.get('events', []))} events, {len(data.get('notes', []))} notes"
+    )
     print(f"Data {mode} database ({counts})")
 
 
@@ -637,6 +795,10 @@ def cmd_purge(store: TaskStore, args):
     print(f"Purged: {target}")
 
 
+# =============================================================================
+# CLI wiring
+# =============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
         prog="agentctl",
@@ -644,75 +806,96 @@ def main():
     )
     parser.add_argument("--db", type=Path, help="Database path (default: ~/.agentctl/tasks.db)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    
+
     subparsers = parser.add_subparsers(dest="command", help="Commands")
-    
-    # Add command
+
+    # add
     add_parser = subparsers.add_parser("add", help="Add a new task")
     add_parser.add_argument("title", help="Task title")
     add_parser.add_argument("-d", "--description", help="Task description")
-    add_parser.add_argument("-p", "--priority", choices=["low", "medium", "high"], 
-                           default="medium", help="Task priority")
+    add_parser.add_argument("-p", "--priority", choices=["low", "medium", "high"],
+                            default="medium", help="Task priority")
     add_parser.add_argument("--tags", help="Comma-separated tags (e.g. deploy,urgent)")
+    add_parser.add_argument("--due", metavar="DATE",
+                            help="Due date: +1h / +2d / +30m (relative) or YYYY-MM-DD / YYYY-MM-DDTHH:MM")
     add_parser.add_argument("-m", "--metadata", help="JSON metadata string")
     add_parser.set_defaults(func=cmd_add)
-    
-    # List command
+
+    # list
     list_parser = subparsers.add_parser("list", help="List tasks")
-    list_parser.add_argument("-s", "--status", choices=["pending", "in_progress", "completed", "blocked"],
-                            help="Filter by status")
+    list_parser.add_argument("-s", "--status",
+                             choices=["pending", "in_progress", "completed", "blocked"],
+                             help="Filter by status")
     list_parser.add_argument("--tag", help="Filter by tag")
+    list_parser.add_argument("--overdue", action="store_true",
+                             help="Show only overdue tasks (past due date, not completed)")
     list_parser.add_argument("-n", "--limit", type=int, default=50, help="Limit results")
     list_parser.set_defaults(func=cmd_list)
-    
-    # Show command
-    show_parser = subparsers.add_parser("show", help="Show task details")
+
+    # show
+    show_parser = subparsers.add_parser("show", help="Show task details (including notes)")
     show_parser.add_argument("task_id", type=int, help="Task ID")
     show_parser.set_defaults(func=cmd_show)
-    
-    # Update command
+
+    # update
     update_parser = subparsers.add_parser("update", help="Update a task")
     update_parser.add_argument("task_id", type=int, help="Task ID")
     update_parser.add_argument("-t", "--title", help="New title")
     update_parser.add_argument("-d", "--description", help="New description")
-    update_parser.add_argument("-s", "--status", choices=["pending", "in_progress", "completed", "blocked"],
-                              help="New status")
+    update_parser.add_argument("-s", "--status",
+                               choices=["pending", "in_progress", "completed", "blocked"],
+                               help="New status")
     update_parser.add_argument("-p", "--priority", choices=["low", "medium", "high"],
-                              help="New priority")
-    update_parser.add_argument("--tags", help="Comma-separated tags (e.g. deploy,urgent). Pass empty string to clear.")
+                               help="New priority")
+    update_parser.add_argument("--tags",
+                               help="Comma-separated tags. Pass empty string to clear.")
+    update_parser.add_argument("--due", metavar="DATE",
+                               help="New due date: +1h / +2d / YYYY-MM-DD / YYYY-MM-DDTHH:MM")
+    update_parser.add_argument("--clear-due", action="store_true",
+                               help="Remove the due date")
     update_parser.add_argument("-m", "--metadata", help="JSON metadata string")
     update_parser.set_defaults(func=cmd_update)
-    
-    # Delete command
+
+    # note
+    note_parser = subparsers.add_parser("note", help="Append a timestamped note to a task")
+    note_parser.add_argument("task_id", type=int, help="Task ID")
+    note_parser.add_argument("text", help="Note text")
+    note_parser.set_defaults(func=cmd_note)
+
+    # delete
     delete_parser = subparsers.add_parser("delete", help="Delete a task")
     delete_parser.add_argument("task_id", type=int, help="Task ID")
     delete_parser.set_defaults(func=cmd_delete)
-    
-    # Status command
+
+    # status
     status_parser = subparsers.add_parser("status", help="Show overall status")
     status_parser.set_defaults(func=cmd_status)
-    
-    # State subcommand
+
+    # tags
+    tags_parser = subparsers.add_parser("tags", help="List all tags with task counts")
+    tags_parser.set_defaults(func=cmd_tags)
+
+    # state
     state_parser = subparsers.add_parser("state", help="Manage state values")
     state_subparsers = state_parser.add_subparsers(dest="state_command", help="State commands")
-    
+
     state_set_parser = state_subparsers.add_parser("set", help="Set a state value")
     state_set_parser.add_argument("key", help="State key")
     state_set_parser.add_argument("value", help="State value")
     state_set_parser.set_defaults(func=cmd_state_set)
-    
+
     state_get_parser = state_subparsers.add_parser("get", help="Get a state value")
     state_get_parser.add_argument("key", help="State key")
     state_get_parser.set_defaults(func=cmd_state_get)
 
-    # Log command
+    # log
     log_parser = subparsers.add_parser("log", help="Log a structured event")
     log_parser.add_argument("message", help="Event message")
-    log_parser.add_argument("--tag", help="Optional tag to categorise the event")
+    log_parser.add_argument("--tag", help="Optional tag")
     log_parser.add_argument("--data", help="Optional JSON data payload")
     log_parser.set_defaults(func=cmd_log)
 
-    # Logs command
+    # logs
     logs_parser = subparsers.add_parser("logs", help="List recent events")
     logs_parser.add_argument("--tag", help="Filter by tag")
     logs_parser.add_argument("--since", metavar="DURATION",
@@ -722,43 +905,39 @@ def main():
                              help="Also print the data payload for each event")
     logs_parser.set_defaults(func=cmd_logs)
 
-    # Report command
+    # report
     report_parser = subparsers.add_parser("report", help="Generate a summary report")
     report_parser.add_argument("--since", metavar="DURATION", default="24h",
                                help="Report window (default: 24h). E.g. 1h, 7d")
     report_parser.set_defaults(func=cmd_report)
 
-    # Checkpoint command
+    # checkpoint
     cp_parser = subparsers.add_parser("checkpoint", help="Export full state to a JSON file")
     cp_parser.add_argument("-o", "--output", help="Output file path (default: auto-named)")
     cp_parser.set_defaults(func=cmd_checkpoint)
 
-    # Restore command
+    # restore
     restore_parser = subparsers.add_parser("restore", help="Restore state from a checkpoint file")
     restore_parser.add_argument("file", help="Checkpoint JSON file to restore from")
     restore_parser.add_argument("--merge", action="store_true",
                                 help="Merge into existing data instead of replacing")
     restore_parser.set_defaults(func=cmd_restore)
 
-    # Purge command
+    # purge
     purge_parser = subparsers.add_parser("purge", help="Delete all data (or specific tables)")
     purge_parser.add_argument("target", nargs="?", default="all",
-                              choices=["tasks", "events", "state", "all"],
+                              choices=["tasks", "events", "state", "notes", "all"],
                               help="What to purge (default: all)")
     purge_parser.add_argument("-y", "--yes", action="store_true",
                               help="Skip confirmation prompt")
     purge_parser.set_defaults(func=cmd_purge)
 
-    # Tags command
-    tags_parser = subparsers.add_parser("tags", help="List all tags with task counts")
-    tags_parser.set_defaults(func=cmd_tags)
-
     args = parser.parse_args()
-    
+
     if not args.command:
         parser.print_help()
         sys.exit(1)
-    
+
     store = TaskStore(args.db)
     args.func(store, args)
 
