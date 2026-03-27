@@ -10,9 +10,12 @@ A lightweight CLI for managing AI agent tasks and state.
 - **Status Tracking**: Track task states (pending, in_progress, completed, blocked)
 - **Priority Levels**: Assign low/medium/high priority to tasks
 - **Task Tagging**: Tag tasks with comma-separated labels and filter or summarise by tag
+- **Due Dates**: Set deadlines with relative (+1h, +2d) or absolute (YYYY-MM-DD) formats
+- **Overdue Detection**: Filter overdue tasks; visual indicators (🔴/🟡) in list output
+- **Per-task Notes**: Append timestamped progress notes without overwriting descriptions
 - **State Storage**: Key-value state storage for agent persistence
 - **Checkpoints**: Export/restore full state to portable JSON - survive context resets, migrate between machines
-- **Purge**: Clean wipe of tasks, events, state, or everything
+- **Purge**: Clean wipe of tasks, events, state, notes, or everything
 - **Event Logging**: Log structured events with tags and JSON data payloads
 - **Reports**: Generate time-window summaries of tasks and events
 - **Zero Dependencies**: Uses only Python standard library + SQLite
@@ -47,8 +50,17 @@ agentctl add "Review pull requests" -d "Check and review pending PRs" -p high
 # Add a task with tags
 agentctl add "Deploy v2.0" -p high --tags "deploy,urgent"
 
+# Add a task with a due date (relative)
+agentctl add "Fix login bug" -p high --due +4h
+
+# Add a task with a due date (absolute)
+agentctl add "Quarterly review" -p medium --due 2025-06-30
+
 # List all tasks
 agentctl list
+
+# List only overdue tasks
+agentctl list --overdue
 
 # Filter tasks by tag
 agentctl list --tag deploy
@@ -59,8 +71,17 @@ agentctl tags
 # Update task status
 agentctl update 1 -s in_progress
 
-# Update task tags
-agentctl update 1 --tags "deploy,done"
+# Set a due date on an existing task
+agentctl update 1 --due +2d
+
+# Remove a due date
+agentctl update 1 --clear-due
+
+# Append a progress note to a task
+agentctl note 1 "Completed auth refactor, testing next"
+
+# Show task details (includes notes)
+agentctl show 1
 
 # Mark as completed
 agentctl update 1 -s completed
@@ -80,229 +101,141 @@ agentctl report
 ### Task Management
 
 ```bash
-# Add tasks with different priorities
-agentctl add "Deploy to production" -p high
-agentctl add "Update documentation" -p low -d "Add examples to README"
+# Add tasks with full options
+agentctl add "Deploy API" -d "Deploy to production" -p high --tags "deploy,prod" --due +2d
 
-# Add a task with tags
-agentctl add "Deploy to production" -p high --tags "deploy,urgent"
-
-# List pending tasks only
+# List high-priority tasks
 agentctl list -s pending
 
-# Filter by tag
-agentctl list --tag deploy
-
-# Show task details (includes tags)
-agentctl show 1
-
-# Update task title and priority
-agentctl update 1 -t "Deploy v2.0 to production" -p high
-
-# Add/replace tags on a task
-agentctl update 1 --tags "deploy,release"
-
-# Clear all tags from a task
-agentctl update 1 --tags ""
-
-# Delete a task
-agentctl delete 1
+# Show full task details with notes
+agentctl show 3
 ```
 
-### Task Tagging
+### Due Dates
+
+Due dates support three input formats:
 
 ```bash
-# Tag a task at creation time
-agentctl add "Fix auth bug" -p high --tags "bug,auth,urgent"
+# Relative (from now)
+agentctl add "Quick fix" --due +30m    # 30 minutes
+agentctl add "Code review" --due +4h   # 4 hours
+agentctl add "Sprint task" --due +3d   # 3 days
 
-# Add tags when updating
-agentctl update 3 --tags "bug,auth,reviewed"
+# Date only (treated as end of day 23:59:59)
+agentctl add "Quarterly report" --due 2025-06-30
 
-# List all tasks with a specific tag
-agentctl list --tag bug
+# Date + time
+agentctl add "Team standup prep" --due 2025-06-30T09:00
+```
 
-# Combine tag filter with status filter
-agentctl list --tag urgent -s pending
+In list output, due dates show with visual indicators:
+- 🔴 = overdue (past due date)
+- 🟡 = due within 24 hours
+- Plain date = more than 24 hours away
 
-# Show all tags across all tasks with counts
-agentctl tags
-# Output: bug (3) | auth (2) | urgent (1) | reviewed (1)
+### Per-task Notes
+
+Notes let agents (or humans) append progress updates without overwriting the task description:
+
+```bash
+# Append notes as work progresses
+agentctl note 5 "Started investigation - issue in auth middleware"
+agentctl note 5 "Root cause found: token expiry not handled"
+agentctl note 5 "Fix deployed to staging, waiting for QA sign-off"
+
+# All notes appear in show output
+agentctl show 5
+```
+
+### Checkpoint & Restore
+
+```bash
+# Export everything (tasks, state, events, notes) to a JSON file
+agentctl checkpoint -o my-backup.json
+
+# Restore from checkpoint (replaces existing data)
+agentctl restore my-backup.json
+
+# Merge checkpoint into existing data
+agentctl restore my-backup.json --merge
 ```
 
 ### State Management
 
 ```bash
-# Store state values
-agentctl state set last_run "2026-02-27T15:00:00"
-agentctl state set current_project "agentctl"
+# Store key-value state for the agent
+agentctl state set last_run "2025-06-01T14:00:00"
+agentctl state set current_phase "ingestion"
 
-# Retrieve state values
+# Retrieve state
 agentctl state get last_run
-# Output: 2026-02-27T15:00:00
-
-# Use in scripts
-LAST_RUN=$(agentctl state get last_run)
-echo "Last run: $LAST_RUN"
 ```
-
-### Event Logging
-
-```bash
-# Log a plain event
-agentctl log "Agent started"
-
-# Log with a tag (useful for filtering later)
-agentctl log "Fetched 100 records" --tag sync
-
-# Log with structured JSON data
-agentctl log "Rate limit hit" --tag error --data '{"code":429,"retry_after":60}'
-
-# List all events
-agentctl logs
-
-# Filter by tag
-agentctl logs --tag error
-
-# Show events from the last hour
-agentctl logs --since 1h
-
-# Show events from the last 7 days, including data payloads
-agentctl logs --since 7d --data
-```
-
-Duration formats for `--since`: `30m` (minutes), `1h` (hours), `7d` (days).
 
 ### Reports
 
 ```bash
-# Default: last 24 hours
+# Last 24 hours (default)
 agentctl report
 
-# Custom window
+# Last 7 days
 agentctl report --since 7d
+
+# Last hour
 agentctl report --since 1h
 ```
 
-A report shows:
-- Task totals (all time) and tasks completed within the window
-- Event counts by tag within the window
-- The 10 most recent events
-
-### Integration in Agent Workflows
-
-```bash
-#!/bin/bash
-# Example: Daily agent workflow with event logging
-
-# Check if already running
-if [ "$(agentctl state get daily_run_status)" = "running" ]; then
-    agentctl log "Skipped: daily run already in progress" --tag cron
-    exit 0
-fi
-
-agentctl state set daily_run_status "running"
-agentctl log "Daily run started" --tag cron
-
-# Process pending tasks
-for task_id in $(agentctl list -s pending --limit 10 | tail -n +3 | awk '{print $1}'); do
-    agentctl update "$task_id" -s in_progress
-
-    if process_task "$task_id"; then
-        agentctl update "$task_id" -s completed
-        agentctl log "Task $task_id completed" --tag cron
-    else
-        agentctl update "$task_id" -s blocked
-        agentctl log "Task $task_id blocked" --tag error
-    fi
-done
-
-agentctl state set daily_run_status "idle"
-agentctl state set last_run "$(date -Iseconds)"
-agentctl log "Daily run finished" --tag cron
-
-# Print a summary
-agentctl report --since 1h
-```
-
-## Commands
+## Commands Reference
 
 | Command | Description |
 |---------|-------------|
-| `add` | Create a new task |
-| `list` | List tasks with optional filters |
-| `show` | Display detailed task information |
-| `update` | Modify task properties |
-| `delete` | Remove a task |
-| `status` | Show task statistics |
-| `tags` | List all tags with task counts |
-| `state set` | Store a state value |
-| `state get` | Retrieve a state value |
+| `add` | Add a new task (`--due`, `--tags`, `-p`, `-d`) |
+| `list` | List tasks (`--overdue`, `--tag`, `-s`, `-n`) |
+| `show <id>` | Show task details + notes |
+| `update <id>` | Update task fields (`--due`, `--clear-due`, `--tags`, `-s`, `-p`) |
+| `note <id> <text>` | Append a timestamped note to a task |
+| `delete <id>` | Delete a task (and its notes) |
+| `status` | Show task statistics (incl. overdue count) |
+| `tags` | List all tags with counts |
+| `state set/get` | Key-value state storage |
 | `log` | Log a structured event |
-| `logs` | List recent events with optional filters |
-| `report` | Generate a summary report of tasks and events |
-| `checkpoint` | Export full state to a portable JSON file |
-| `restore` | Restore state from a checkpoint file |
-| `purge` | Delete all data (or specific tables) |
-
-## Options
-
-| Flag | Description |
-|------|-------------|
-| `-d, --description` | Task description |
-| `-p, --priority` | Priority: low, medium, high |
-| `-s, --status` | Status: pending, in_progress, completed, blocked |
-| `--tags` | Comma-separated task tags (e.g. `deploy,urgent`) |
-| `--tag` | Filter list by tag / tag for event log |
-| `-m, --metadata` | JSON metadata string |
-| `-n, --limit` | Limit number of results |
-| `--db` | Custom database path |
-| `--data` | JSON data payload (log) or show payloads flag (logs) |
-| `--since` | Duration window: 30m, 1h, 24h, 7d |
-| `-o, --output` | Checkpoint output file path |
-| `--merge` | Merge restored data instead of replacing |
-| `-y, --yes` | Skip purge confirmation |
-
-### Checkpoints & Recovery
-
-```bash
-# Save a checkpoint before risky operations
-agentctl checkpoint -o backup.json
-
-# Restore from checkpoint (replaces current data)
-agentctl restore backup.json
-
-# Merge checkpoint into existing data
-agentctl restore backup.json --merge
-
-# Wipe everything
-agentctl purge -y
-
-# Wipe only events
-agentctl purge events -y
-```
-
-Checkpoints are portable JSON - move them between machines, back them up, diff them in git.
-Useful for agent continuity across context resets or when migrating between environments.
+| `logs` | List recent events |
+| `report` | Time-windowed summary of tasks + events |
+| `checkpoint` | Export all data to JSON |
+| `restore` | Restore from checkpoint JSON |
+| `purge` | Delete data (tasks/events/state/notes/all) |
 
 ## Database
 
-By default, data is stored in `~/.agentctl/tasks.db`. Override with `--db` flag:
+By default, agentctl stores data at `~/.agentctl/tasks.db`. Override with `--db`:
 
 ```bash
-agentctl --db /path/to/custom.db status
+agentctl --db /path/to/custom.db list
 ```
 
-The database has three tables: `tasks`, `state`, and `events`.
+`agentctl` automatically migrates existing databases when new columns are added - no manual migration needed.
 
-## Requirements
+## Changelog
 
-- Python 3.8+
-- No external dependencies
+### v0.5.0
+- **Due dates**: `--due` flag on `add`/`update` with relative (+1h/+2d/+30m) and absolute (YYYY-MM-DD/YYYY-MM-DDTHH:MM) formats
+- **Overdue filter**: `agentctl list --overdue` shows tasks past their due date
+- **Visual due indicators**: 🔴 (overdue) and 🟡 (due within 24h) in list output
+- **Note command**: `agentctl note <id> <text>` appends timestamped progress notes
+- **Notes in show**: Notes displayed in `agentctl show` output
+- **Notes in checkpoint/restore**: Notes included in full-state export
+- **Overdue section in report**: Report now lists overdue tasks separately
+- **Overdue count in status**: `agentctl status` shows overdue count when non-zero
+- **`--clear-due` flag**: Remove a due date from an existing task
+- Auto-migration: `due_at` column and `task_notes` table added to existing DBs on startup
 
-## License
+### v0.4.0
+- Tags: `--tags` flag on `add`/`update`, `agentctl tags` command, `--tag` filter on `list`
 
-MIT License - see [LICENSE](LICENSE) file.
+### v0.3.0
+- Checkpoint and restore: full-state export/import to portable JSON
 
-## Contributing
+### v0.2.0
+- Event logging: `log`, `logs` commands with tag and time filters
 
-Contributions welcome! Please open an issue or PR on GitHub.
+### v0.1.0
+- Initial release: task management, state storage, reports
