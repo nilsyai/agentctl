@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 DEFAULT_DB_PATH = Path.home() / ".agentctl" / "tasks.db"
 
@@ -446,6 +446,61 @@ class TaskStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_velocity(self, days: int = 7) -> dict:
+        """Return per-day task completion counts for the last N days."""
+        cutoff = (datetime.now() - timedelta(days=days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT date(completed_at) as day, COUNT(*) as count
+                   FROM tasks
+                   WHERE status = 'completed'
+                     AND completed_at >= ?
+                   GROUP BY date(completed_at)
+                   ORDER BY day""",
+                (cutoff.isoformat(),)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_completion_stats(self) -> dict:
+        """Return aggregate completion statistics."""
+        with sqlite3.connect(self.db_path) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            completed_total = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'completed'"
+            ).fetchone()[0]
+            with_due = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE due_at IS NOT NULL"
+            ).fetchone()[0]
+            overdue = conn.execute(
+                """SELECT COUNT(*) FROM tasks
+                   WHERE due_at IS NOT NULL
+                     AND due_at < ?
+                     AND status NOT IN ('completed')""",
+                (datetime.now().isoformat(),)
+            ).fetchone()[0]
+            # Avg time to complete (hours) for completed tasks with created_at
+            avg_ttc_row = conn.execute(
+                """SELECT AVG(
+                       (julianday(completed_at) - julianday(created_at)) * 24
+                   ) FROM tasks
+                   WHERE status = 'completed'
+                     AND completed_at IS NOT NULL
+                     AND created_at IS NOT NULL"""
+            ).fetchone()[0]
+            avg_ttc_hours = round(float(avg_ttc_row), 1) if avg_ttc_row else None
+            return {
+                "total": total,
+                "completed": completed_total,
+                "completion_rate": round(completed_total / total * 100, 1) if total > 0 else 0,
+                "with_due": with_due,
+                "overdue": overdue,
+                "overdue_rate": round(overdue / with_due * 100, 1) if with_due > 0 else 0,
+                "avg_ttc_hours": avg_ttc_hours,
+            }
+
 
 # =============================================================================
 # Helper
@@ -618,6 +673,46 @@ def cmd_status(store: TaskStore, args):
     print(f"  ✅ Completed:   {stats['completed']}")
     if stats["overdue"]:
         print(f"  🔴 Overdue:     {stats['overdue']}")
+
+
+def cmd_stat(store: TaskStore, args):
+    """Show velocity and completion analytics."""
+    days = args.days
+    cs = store.get_completion_stats()
+    velocity = store.get_velocity(days=days)
+
+    print(f"=== agentctl stats ({days}d window) ===")
+    print(f"Completion rate: {cs['completion_rate']}% ({cs['completed']}/{cs['total']} total)")
+    if cs['avg_ttc_hours'] is not None:
+        print(f"Avg time to complete: {cs['avg_ttc_hours']}h")
+    if cs['with_due'] > 0:
+        print(f"Overdue rate: {cs['overdue_rate']}% ({cs['overdue']}/{cs['with_due']} with due dates)")
+    else:
+        print("Overdue rate: n/a (no tasks with due dates)")
+
+    # Build per-day map
+    day_map = {v["day"]: v["count"] for v in velocity}
+    today = datetime.now().date()
+    labels = []
+    counts = []
+    for i in range(days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        labels.append(d.strftime("%m-%d"))
+        counts.append(day_map.get(d.isoformat(), 0))
+
+    max_c = max(counts) if counts else 1
+    bar_width = 8
+    print(f"\nDaily completion velocity (last {days} days):")
+    print(f"  Max: {max_c}/day")
+    for label, count in zip(labels, counts):
+        bar_len = int(count / max_c * bar_width) if max_c > 0 else 0
+        bar = "█" * bar_len + "·" * (bar_width - bar_len)
+        print(f"  {label} {bar} {count}")
+
+    total_completed_window = sum(counts)
+    avg_daily = round(total_completed_window / days, 2) if days > 0 else 0
+    print(f"\n  Total completed (window): {total_completed_window}")
+    print(f"  Daily average: {avg_daily}")
 
 
 def cmd_tags(store: TaskStore, args):
@@ -870,6 +965,14 @@ def main():
     # status
     status_parser = subparsers.add_parser("status", help="Show overall status")
     status_parser.set_defaults(func=cmd_status)
+
+    # stat
+    stat_parser = subparsers.add_parser("stat", help="Show velocity and completion analytics")
+    stat_parser.add_argument(
+        "-d", "--days", type=int, default=7,
+        help="Velocity window in days (default: 7)"
+    )
+    stat_parser.set_defaults(func=cmd_stat)
 
     # tags
     tags_parser = subparsers.add_parser("tags", help="List all tags with task counts")

@@ -17,6 +17,7 @@ A lightweight CLI for managing AI agent tasks and state.
 - **Checkpoints**: Export/restore full state to portable JSON - survive context resets, migrate between machines
 - **Purge**: Clean wipe of tasks, events, state, notes, or everything
 - **Event Logging**: Log structured events with tags and JSON data payloads
+- **Velocity Analytics**: Per-day completion charts and aggregate completion stats
 - **Reports**: Generate time-window summaries of tasks and events
 - **Zero Dependencies**: Uses only Python standard library + SQLite
 - **Simple CLI**: Intuitive commands with emoji-enhanced output
@@ -195,6 +196,7 @@ agentctl report --since 1h
 | `note <id> <text>` | Append a timestamped note to a task |
 | `delete <id>` | Delete a task (and its notes) |
 | `status` | Show task statistics (incl. overdue count) |
+| `stat` | Velocity and completion analytics with daily bar chart |
 | `tags` | List all tags with counts |
 | `state set/get` | Key-value state storage |
 | `log` | Log a structured event |
@@ -215,6 +217,13 @@ agentctl --db /path/to/custom.db list
 `agentctl` automatically migrates existing databases when new columns are added - no manual migration needed.
 
 ## Changelog
+
+### v0.6.0
+- **`stat` command**: Velocity analytics with daily completion bar chart
+  - Per-day completion counts for the last N days (default: 7)
+  - Aggregate stats: completion rate, avg time-to-complete, overdue rate
+  - ASCII bar chart showing daily completion velocity
+  - `agentctl stat` (7-day default), `agentctl stat --days 30` for wider window
 
 ### v0.5.0
 - **Due dates**: `--due` flag on `add`/`update` with relative (+1h/+2d/+30m) and absolute (YYYY-MM-DD/YYYY-MM-DDTHH:MM) formats
